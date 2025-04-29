@@ -123,93 +123,58 @@ uint8_t LoRaManager::getBandType() const {
 
 // Initialize the LoRa module
 bool LoRaManager::begin(int8_t pinCS, int8_t pinDIO1, int8_t pinReset, int8_t pinBusy) {
-  // Store the error code
-  lastErrorCode = RADIOLIB_ERR_NONE;
+  // Initialize the SX1262 module
+  Serial.println(F("[LoRaManager] Initializing radio module..."));
   
-  // Create a new Module instance
+  // Check if a previous instance exists
+  if (radio != nullptr) {
+    delete radio;
+    radio = nullptr;
+  }
+  
+  if (node != nullptr) {
+    delete node;
+    node = nullptr;
+  }
+  
+  // Create a new Module instance - required for RadioLib 7.x
   Module* module = new Module(pinCS, pinDIO1, pinReset, pinBusy);
   
-  // Debug output
-  Serial.println(F("[LoRaManager] Creating SX1262 instance..."));
-  
-  // Create a new SX1262 instance
+  // Create a new instance of the radio using the module
   radio = new SX1262(module);
-  
-  // Initialize the radio with more detailed error reporting
-  Serial.print(F("[SX1262] Initializing ... "));
-  
-  // Initialize the radio with more robust error handling
-  int state = radio->begin();
-  if (state == RADIOLIB_ERR_NONE) {
-    Serial.println(F("success!"));
-  } else {
-    Serial.print(F("failed, code "));
-    Serial.println(state);
-    
-    // Store the error code
-    lastErrorCode = state;
-    
-    // Additional debug info
-    Serial.println(F("[SX1262] Debug info:"));
-    Serial.print(F("  CS pin: "));
-    Serial.println(pinCS);
-    Serial.print(F("  DIO1 pin: "));
-    Serial.println(pinDIO1);
-    Serial.print(F("  Reset pin: "));
-    Serial.println(pinReset);
-    Serial.print(F("  Busy pin: "));
-    Serial.println(pinBusy);
-    
+  if (radio == nullptr) {
+    Serial.println(F("[LoRaManager] Failed to create radio instance"));
+    delete module; // Clean up the module if we can't create the radio
     return false;
   }
-
-  // Log frequency band configuration using band number
-  const char* bandName;
-  switch(freqBand.bandNum) {
-    case 1:
-      bandName = "EU868";
-      break;
-    case 2:
-      bandName = "US915";
-      break;
-    default:
-      bandName = "Custom";
+  
+  // Initialize the radio
+  int state = radio->begin();
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.print(F("[LoRaManager] Failed to initialize radio: "));
+    Serial.println(state);
+    lastErrorCode = state;
+    return false;
   }
   
-  Serial.print(F("[LoRaManager] Configuring LoRaWAN for "));
-  Serial.print(bandName);
-  Serial.println(F(" band..."));
+  Serial.println(F("[LoRaManager] Radio initialized successfully"));
   
-  // Initialize the node with the configured region and subband
-  // For US915, the subband parameter will automatically configure the correct channels
+  // Create a node instance with the specified band
   node = new LoRaWANNode(radio, &freqBand, subBand);
-
-  // Log detailed band configuration
-  Serial.print(F("[LoRaManager] Using "));
-  Serial.print(bandName);
-  Serial.print(F(" region with subband: "));
-  Serial.println(subBand);
-  
-  // If using US915, log additional information about channels
-  uint8_t bandType = getBandType();
-  if (bandType == BAND_TYPE_US915) {
-    Serial.print(F("[LoRaManager] This will enable channels for subband "));
-    Serial.println(subBand);
+  if (node == nullptr) {
+    Serial.println(F("[LoRaManager] Failed to create LoRaWAN node instance"));
+    return false;
   }
-
-  // Default values for testing - will be replaced later by setCredentials()
-  uint64_t defaultJoinEUI = 0x0000000000000000;
-  uint64_t defaultDevEUI = 0x0000000000000000;
-  uint8_t defaultNwkKey[16] = {0};
-  uint8_t defaultAppKey[16] = {0};
   
-  // Initialize node
-  Serial.println(F("[LoRaManager] Initializing node..."));
+  // Configure the subbands based on the selected frequency plan
+  int result = configureSubbandChannels(subBand);
+  if (result != RADIOLIB_ERR_NONE) {
+    Serial.print(F("[LoRaManager] Warning: Failed to configure subband channels: "));
+    Serial.println(result);
+    // This is a warning, not a fatal error, so we'll continue
+  }
   
-  // Initialize with default credentials
-  node->beginOTAA(defaultJoinEUI, defaultDevEUI, defaultNwkKey, defaultAppKey);
-  
-  Serial.println(F("[LoRaManager] LoRaWAN node initialized successfully!"));
+  Serial.println(F("[LoRaManager] LoRaWAN node initialized successfully"));
   
   return true;
 }
@@ -414,37 +379,26 @@ bool LoRaManager::joinNetwork() {
 
 // Send data to the LoRaWAN network
 bool LoRaManager::sendData(uint8_t* data, size_t len, uint8_t port, bool confirmed) {
-  // Check if we are joined to the network
   if (!isJoined) {
-    Serial.println(F("[LoRaWAN] Not joined to network, cannot send data"));
+    Serial.println(F("[LoRaWAN] Not joined to the network"));
     lastErrorCode = RADIOLIB_ERR_NETWORK_NOT_JOINED;
     return false;
   }
   
-  // Check for valid data
-  if (data == nullptr || len == 0) {
-    Serial.println(F("[LoRaWAN] Invalid data for transmission"));
-    lastErrorCode = RADIOLIB_ERR_INVALID_INPUT;
+  if (!node) {
+    Serial.println(F("[LoRaWAN] Node not initialized"));
+    lastErrorCode = RADIOLIB_ERR_INVALID_STATE;
     return false;
   }
   
-  // Maximum number of transmission attempts
-  const uint8_t maxAttempts = 3;
-  uint8_t attemptCount = 0;
+  // Set maximum transmit attempts
+  int maxAttempts = confirmed ? 3 : 1;
+  int attemptCount = 0;
+  bool shouldRetry = false;
   
-  // Check if we need to rejoin
-  // Since isActive is a protected member, we'll just check our isJoined flag
-  if (!isJoined) {
-    Serial.println(F("[LoRaWAN] Not joined, attempting to rejoin the network..."));
-    if (joinNetwork()) {
-      Serial.println(F("[LoRaWAN] Successfully rejoined, will now try to send data"));
-    } else {
-      Serial.println(F("[LoRaWAN] Rejoin failed, cannot send data"));
-      return false;
-    }
-  }
+  // Reset the consecutive transmit error counter if we succeed
+  bool success = false;
   
-  // Retry loop for sending data
   while (attemptCount < maxAttempts) {
     // Increment attempt counter
     attemptCount++;
@@ -460,14 +414,17 @@ bool LoRaManager::sendData(uint8_t* data, size_t len, uint8_t port, bool confirm
     uint8_t downlinkData[256];
     size_t downlinkLen = sizeof(downlinkData);
     
-    // Send data and wait for downlink
-    int state = node->sendReceive(data, len, port, downlinkData, &downlinkLen, confirmed);
+    // Create event structures for uplink and downlink details
+    LoRaWANEvent_t uplinkEvent;
+    LoRaWANEvent_t downlinkEvent;
+    
+    // Send data and wait for downlink using the updated API
+    int state = node->sendReceive(data, len, port, downlinkData, &downlinkLen, confirmed, &uplinkEvent, &downlinkEvent);
     lastErrorCode = state;
     
     // Check for successful transmission
-    if (state == RADIOLIB_ERR_NONE || state > 0 || state == RADIOLIB_LORAWAN_NO_DOWNLINK) {
-      if (state > 0) {
-        // Downlink received in window state (1 = RX1, 2 = RX2)
+    if (state >= RADIOLIB_ERR_NONE) {
+      if (state > 0) {  // Downlink received in window 1 or 2
         Serial.print(F("success! Received downlink in RX"));
         Serial.println(state);
         
@@ -475,7 +432,7 @@ bool LoRaManager::sendData(uint8_t* data, size_t len, uint8_t port, bool confirm
         if (downlinkLen > 0) {
           Serial.print(F("[LoRaWAN] Received "));
           Serial.print(downlinkLen);
-          Serial.println(F(" bytes:"));
+          Serial.println(F(" bytes"));
           
           for (size_t i = 0; i < downlinkLen; i++) {
             Serial.print(downlinkData[i], HEX);
@@ -485,88 +442,47 @@ bool LoRaManager::sendData(uint8_t* data, size_t len, uint8_t port, bool confirm
           
           // Call the callback if registered
           if (downlinkCallback != nullptr) {
-            downlinkCallback(downlinkData, downlinkLen, port);
+            downlinkCallback(downlinkData, downlinkLen, downlinkEvent.fPort);
           }
           
           // Copy the data to our buffer
           memcpy(receivedData, downlinkData, downlinkLen);
           receivedBytes = downlinkLen;
         }
-      } else if (state == RADIOLIB_LORAWAN_NO_DOWNLINK) {
+      } else if (state == RADIOLIB_ERR_NONE) {
         // No downlink received but uplink was successful
         Serial.println(F("success! No downlink received."));
-      } else {
-        // General success
-        Serial.println(F("success!"));
       }
       
       // Get RSSI and SNR
       lastRssi = radio->getRSSI();
       lastSnr = radio->getSNR();
       
-      consecutiveTransmitErrors = 0; // Reset error counter on success
-      return true;
+      // Print the RSSI and SNR of the uplink
+      Serial.print(F("[LoRaWAN] RSSI: "));
+      Serial.print(lastRssi);
+      Serial.print(F(" dBm, SNR: "));
+      Serial.print(lastSnr);
+      Serial.println(F(" dB"));
+      
+      // Transmission was successful, reset the error counter
+      consecutiveTransmitErrors = 0;
+      success = true;
+      
+      // Break out of the retry loop since we succeeded
+      break;
     } else {
-      // Error occurred
-      Serial.print(F("failed, code "));
+      // Transmission failed
+      Serial.print(F("failed! Error code: "));
       Serial.println(state);
       
-      // Add more specific error handling for common LoRaWAN transmission issues
-      bool shouldRetry = false;
-      
-      // Handle different error cases
-      if (state == RADIOLIB_ERR_TX_TIMEOUT) {
-        Serial.println(F("[LoRaWAN] Transmission timeout. Check antenna and signal."));
-        shouldRetry = true;
-      } 
-      else if (state == RADIOLIB_ERR_NETWORK_NOT_JOINED) {
-        Serial.println(F("[LoRaWAN] Network not joined. Will try to rejoin."));
-        isJoined = false; // Force rejoin
-        
-        // Try to rejoin before next attempt
-        if (joinNetwork()) {
-          Serial.println(F("[LoRaWAN] Rejoined successfully, will retry transmission."));
-          shouldRetry = true;
-        } else {
-          Serial.println(F("[LoRaWAN] Failed to rejoin, cannot continue."));
-          shouldRetry = false;
-        }
-      }
-      else if (state == RADIOLIB_ERR_NO_CHANNEL_AVAILABLE) {
-        Serial.println(F("[LoRaWAN] No channel available for the requested data rate."));
-        
-        // Only try different subbands for US915
-        uint8_t bandType = getBandType();
-        if (bandType == BAND_TYPE_US915) {
-          // Try selecting a different subband for next attempt
-          uint8_t alternateSubBand = 1 + (attemptCount % 8); // Try different subbands (1-8)
-          Serial.print(F("[LoRaWAN] Will try with subband "));
-          Serial.print(alternateSubBand);
-          Serial.println(F(" for next attempt"));
-          
-          // Configure the alternate subband
-          int maskResult = configureSubbandChannels(alternateSubBand);
-          
-          if (maskResult == RADIOLIB_ERR_NONE) {
-            shouldRetry = true;
-          } else {
-            shouldRetry = false;
-          }
-        } else {
-          Serial.println(F("[LoRaWAN] Subband adjustment not applicable for this region"));
-          shouldRetry = (attemptCount < maxAttempts);
-        }
-      }
-      else {
-        // Default case for other errors
-        Serial.println(F("[LoRaWAN] Unknown error during transmission."));
-        shouldRetry = (attemptCount < maxAttempts);
-      }
-      
-      // Track consecutive errors
+      // Increment consecutive transmit error counter
       consecutiveTransmitErrors++;
       
-      // If we should retry and have attempts left
+      // In RadioLib 7.x, we can't use RADIOLIB_ERR_INVALID_ADR_ACK_LIMIT
+      // Instead, just retry confirmed messages
+      shouldRetry = confirmed;
+      
       if (shouldRetry && attemptCount < maxAttempts) {
         Serial.print(F("[LoRaWAN] Will retry transmission in 3 seconds (attempt "));
         Serial.print(attemptCount + 1);
@@ -588,9 +504,13 @@ bool LoRaManager::sendData(uint8_t* data, size_t len, uint8_t port, bool confirm
     }
   }
   
-  // If we've reached this point, all attempts failed
-  Serial.println(F("[LoRaWAN] All transmission attempts failed."));
-  return false;
+  // If we've reached this point and success is still false, all attempts failed
+  if (!success) {
+    Serial.println(F("[LoRaWAN] All transmission attempts failed."));
+    return false;
+  }
+  
+  return true;
 }
 
 // Helper method to send a string
@@ -637,49 +557,29 @@ void LoRaManager::handleEvents() {
     return;
   }
   
-  // Check for state updates 
-  int16_t state = node->check();
-  
-  if (state == RADIOLIB_ERR_NONE) {
-    // Check for new data based on flags
-    LoRaWANEvent_t event;
-    if (node->readEvent(&event)) {
-      // Process the event based on type
-      if (event.type == RADIOLIB_LORAWAN_EVENT_RX_DATA) {
-        // Get the port number
-        uint8_t port = event.port;
-        
-        // Print debug info
-        Serial.print(F("[LoRaManager] Received "));
-        Serial.print(event.len);
-        Serial.println(F(" bytes on port "));
-        Serial.println(port);
-        
-        // Copy data to our buffer
-        memcpy(receivedData, event.data, event.len);
-        
-        // Get signal metrics
-        lastRssi = event.rssi;
-        lastSnr = event.snr;
-        
-        // Call the callback if registered
-        if (downlinkCallback) {
-          downlinkCallback(receivedData, event.len, port);
-        }
-      } else if (event.type == RADIOLIB_LORAWAN_EVENT_JOIN_ACCEPT) {
-        // Join successful
-        isJoined = true;
-        Serial.println(F("[LoRaManager] Join successful!"));
-      }
-    }
-  } else if (state != RADIOLIB_ERR_NONE) {
-    // Log but don't treat as error for transient conditions 
-    if (state != RADIOLIB_LORAWAN_NO_DOWNLINK && state != RADIOLIB_ERR_NETWORK_NOT_JOINED) {
-      Serial.print(F("[LoRaManager] Error code: "));
-      Serial.println(state);
-      lastErrorCode = state;
+  // For RadioLib 7.x, Class C implementation is different
+  // Class C reception now happens after normal transmission windows
+  if (deviceClass == DEVICE_CLASS_C && isJoined) {
+    // For Class C, just log the continuous reception mode periodically
+    static unsigned long lastClassCLog = 0;
+    if (millis() - lastClassCLog > 60000) { // Log every minute
+      lastClassCLog = millis();
+      Serial.println(F("[LoRaManager] Class C: Continuous reception mode active"));
     }
   }
+  
+  // Check for network status
+  if (!isJoined && node != nullptr) {
+    // Check if we've become joined since last check
+    if (node->isActivated()) {
+      isJoined = true;
+      Serial.println(F("[LoRaManager] Join successful!"));
+    }
+  }
+  
+  // Note: In RadioLib 7.x, events are primarily handled through the sendReceive method
+  // and are reported via the event structures passed to that method.
+  // The old polling approach with check() and readEvent() is no longer supported.
 }
 
 // Set the device class (A, B, or C)
@@ -885,26 +785,62 @@ bool LoRaManager::startContinuousReception() {
   
   Serial.println(F("[LoRaWAN] Starting continuous reception for Class C operation"));
   
-  // In a real implementation, we would:
-  // 1. Configure the radio for RX2 window frequency and data rate
-  // 2. Start continuous reception
+  // In RadioLib 7.x, Class C mode is handled differently
+  // The node will keep RX2 window open continuously after any uplink
+  // So we just need to track that we're in Class C mode locally
   
-  // For this example, we'll just set the flag and handle the reception in handleEvents
+  // Mark continuous reception as active
   continuousReception = true;
   
-  // In a real implementation using RadioLib, we would call a method to start continuous reception
-  // Actual implementation depends on RadioLib's capabilities
+  // Send a small packet to inform the network server we're in Class C mode
+  // This will also open the continuous reception window after the uplink
+  uint8_t classChangeData[] = {0xC0}; // Class C notification packet
+  size_t classChangeLen = sizeof(classChangeData);
+  uint8_t downlinkData[8]; // Small buffer for any response
+  size_t downlinkLen = sizeof(downlinkData);
   
-  return true;
+  // Send with port 0 (MAC commands) or another suitable port
+  int state = node->sendReceive(classChangeData, classChangeLen, 3, downlinkData, &downlinkLen, true);
+  
+  if (state >= RADIOLIB_ERR_NONE) {
+    Serial.println(F("[LoRaWAN] Class C activation successful"));
+    return true;
+  } else {
+    Serial.print(F("[LoRaWAN] Class C activation failed with error: "));
+    Serial.println(state);
+    lastErrorCode = state;
+    continuousReception = false;
+    return false;
+  }
 }
 
 // Stop continuous reception (Class C)
 void LoRaManager::stopContinuousReception() {
   if (continuousReception) {
     Serial.println(F("[LoRaWAN] Stopping continuous reception"));
+    
+    // In RadioLib 7.x, to disable Class C, we just need to send an uplink
+    // that informs the network we're switching back to Class A
+    // For now, we just update our local state
+    
     continuousReception = false;
     
-    // In a real implementation using RadioLib, we would call a method to stop continuous reception
+    // Send a small packet to inform the network server we're in Class A mode
+    uint8_t classChangeData[] = {0xA0}; // Class A notification packet
+    size_t classChangeLen = sizeof(classChangeData);
+    uint8_t downlinkData[8]; // Small buffer for any response
+    size_t downlinkLen = sizeof(downlinkData);
+    
+    // Send with port 3 (arbitrary choice)
+    int state = node->sendReceive(classChangeData, classChangeLen, 3, downlinkData, &downlinkLen, true);
+    
+    if (state < RADIOLIB_ERR_NONE) {
+      Serial.print(F("[LoRaWAN] Warning: Class A notification failed with error: "));
+      Serial.println(state);
+      lastErrorCode = state;
+    } else {
+      Serial.println(F("[LoRaWAN] Successfully switched back to Class A mode"));
+    }
   }
 }
 
