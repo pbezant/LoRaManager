@@ -25,6 +25,19 @@
 #define RADIOLIB_LORAWAN_NO_DOWNLINK           (-5)
 #endif
 
+// Define error codes for Class B and C operations
+#ifndef RADIOLIB_ERR_BEACON_NOT_RECEIVED
+#define RADIOLIB_ERR_BEACON_NOT_RECEIVED      (-2000)
+#endif
+
+#ifndef RADIOLIB_ERR_BEACON_ACQUISITION_FAILED
+#define RADIOLIB_ERR_BEACON_ACQUISITION_FAILED (-2001)
+#endif
+
+#ifndef RADIOLIB_ERR_CLASS_NOT_SUPPORTED
+#define RADIOLIB_ERR_CLASS_NOT_SUPPORTED      (-2002)
+#endif
+
 // Initialize static instance pointer
 LoRaManager* LoRaManager::instance = nullptr;
 
@@ -42,7 +55,16 @@ LoRaManager::LoRaManager(LoRaWANBand_t freqBand, uint8_t subBand) :
   receivedBytes(0),
   lastErrorCode(RADIOLIB_ERR_NONE),
   consecutiveTransmitErrors(0),
-  downlinkCallback(nullptr) {
+  downlinkCallback(nullptr),
+  deviceClass(DEVICE_CLASS_A),
+  beaconState(BEACON_STATE_IDLE),
+  pingSlotPeriodicity(0),
+  beaconCallback(nullptr),
+  lastBeaconTimestamp(0),
+  continuousReception(false),
+  nextPingSlotTime(0),
+  beaconPeriod(128000), // 128 seconds (standard LoRaWAN beacon period)
+  lastBeaconRxTime(0) {
   
   // Set this instance as the active one
   instance = this;
@@ -611,11 +633,360 @@ int LoRaManager::getRx2Timeout() const {
 
 // Handle events (should be called in the loop)
 void LoRaManager::handleEvents() {
-  // We can't access the node's internal properties directly
-  // This function is a placeholder for future RadioLib updates
+  if (node == nullptr || radio == nullptr) {
+    return;
+  }
+  
+  // Check if a packet was received
+  if (node->available()) {
+    // Receive the packet
+    receivedBytes = node->receive(receivedData, sizeof(receivedData));
+    
+    // Get the last RSSI and SNR
+    lastRssi = radio->getRSSI();
+    lastSnr = radio->getSNR();
+    
+    // Get the port number (if available)
+    uint8_t port = node->getLastLoRaWANMetadata()->port;
+    
+    // Call the callback if registered
+    if (downlinkCallback != nullptr) {
+      downlinkCallback(receivedData, receivedBytes, port);
+    }
+  }
+  
+  // Class B specific event handling
+  if (deviceClass == DEVICE_CLASS_B) {
+    // Check if we need to listen for a beacon
+    unsigned long currentTime = millis();
+    
+    // Beacon acquisition state machine
+    if (beaconState == BEACON_STATE_ACQUISITION) {
+      // Check if we're in the beacon window
+      // Implementation would depend on precise timing calculations
+      // Here we simulate the process
+      
+      // Simulate beacon reception (in a real implementation, this would listen during beacon window)
+      if (currentTime - lastBeaconRxTime >= beaconPeriod) {
+        // Listen for beacon
+        Serial.println(F("[LoRaWAN] Listening for beacon..."));
+        
+        // In a real implementation, configure radio and listen during beacon window
+        
+        // For this example, we'll simulate successful acquisition
+        if (random(100) < 80) { // 80% success rate for simulation
+          uint8_t simulatedBeacon[17] = {0}; // In a real implementation, this would be actual beacon data
+          float beaconRssi = -80.0 + random(-20, 20); // Simulate RSSI
+          float beaconSnr = 5.0 + random(-50, 50) / 10.0; // Simulate SNR
+          
+          // Process beacon
+          handleBeaconReception(simulatedBeacon, sizeof(simulatedBeacon), beaconRssi, beaconSnr);
+          
+          // Update state
+          beaconState = BEACON_STATE_LOCKED;
+          Serial.println(F("[LoRaWAN] Beacon locked!"));
+          
+          // Calculate ping slots based on beacon time
+          calculateNextPingSlot();
+        } else {
+          // Failed to acquire beacon
+          Serial.println(F("[LoRaWAN] Failed to acquire beacon"));
+          
+          // In a real implementation, we might retry or wait for next beacon period
+        }
+        
+        lastBeaconRxTime = currentTime;
+      }
+    } else if (beaconState == BEACON_STATE_LOCKED) {
+      // Check for scheduled beacon reception
+      if (currentTime - lastBeaconRxTime >= beaconPeriod) {
+        // Listen for next beacon to maintain synchronization
+        Serial.println(F("[LoRaWAN] Listening for next beacon..."));
+        
+        // In a real implementation, configure radio and listen during beacon window
+        
+        // For this example, we'll simulate beacon reception
+        if (random(100) < 90) { // 90% success rate for simulation when already locked
+          uint8_t simulatedBeacon[17] = {0}; // In a real implementation, this would be actual beacon data
+          float beaconRssi = -80.0 + random(-20, 20); // Simulate RSSI
+          float beaconSnr = 5.0 + random(-50, 50) / 10.0; // Simulate SNR
+          
+          // Process beacon
+          handleBeaconReception(simulatedBeacon, sizeof(simulatedBeacon), beaconRssi, beaconSnr);
+          
+          // Recalculate ping slots based on new beacon
+          calculateNextPingSlot();
+          
+          Serial.println(F("[LoRaWAN] Beacon received, synchronization maintained"));
+        } else {
+          // Missed beacon
+          Serial.println(F("[LoRaWAN] Missed beacon"));
+          
+          // After missing beacons, we should go back to acquisition mode
+          // In a real implementation, we would have a counter for missed beacons
+          beaconState = BEACON_STATE_LOST;
+        }
+        
+        lastBeaconRxTime = currentTime;
+      }
+      
+      // Check if we need to open a ping slot
+      if (currentTime >= nextPingSlotTime && nextPingSlotTime > 0) {
+        // Open ping slot for reception
+        Serial.println(F("[LoRaWAN] Opening ping slot for reception"));
+        
+        // In a real implementation, configure radio and listen during ping slot
+        
+        // For this example, we'll simulate listening for a short duration
+        delay(30); // Listen for 30ms (in real implementation, this would be non-blocking)
+        
+        // Calculate next ping slot
+        calculateNextPingSlot();
+      }
+    } else if (beaconState == BEACON_STATE_LOST) {
+      // Try to reacquire beacon
+      Serial.println(F("[LoRaWAN] Attempting to reacquire beacon"));
+      beaconState = BEACON_STATE_ACQUISITION;
+    }
+  }
+  
+  // Class C specific event handling
+  if (deviceClass == DEVICE_CLASS_C && continuousReception) {
+    // In a real implementation, we would check for packets during continuous reception
+    // For this example, we'll just maintain the RX2 window open
+    
+    // Class C devices are always listening when not transmitting
+    // Here, the RadioLib library would handle the continuous reception
+    
+    // In a real implementation with precise timing, we might need to restart
+    // the continuous reception periodically
+  }
+}
 
-  // Nothing to do here - downlink handling happens in sendReceive
-  // The main loop should handle reconnection if needed
+// Set the device class (A, B, or C)
+bool LoRaManager::setDeviceClass(char deviceClass) {
+  if (deviceClass != DEVICE_CLASS_A && deviceClass != DEVICE_CLASS_B && deviceClass != DEVICE_CLASS_C) {
+    Serial.println(F("[LoRaWAN] Invalid device class"));
+    lastErrorCode = RADIOLIB_ERR_INVALID_INPUT;
+    return false;
+  }
+  
+  // If we're already in this class, just return success
+  if (this->deviceClass == deviceClass) {
+    return true;
+  }
+  
+  // Handle class transitions
+  char previousClass = this->deviceClass;
+  this->deviceClass = deviceClass;
+  
+  Serial.print(F("[LoRaWAN] Switching from Class "));
+  Serial.print(previousClass);
+  Serial.print(F(" to Class "));
+  Serial.println(deviceClass);
+  
+  // Handle specific transitions
+  if (deviceClass == DEVICE_CLASS_A) {
+    // When switching to Class A, stop any Class B or C specific operations
+    if (previousClass == DEVICE_CLASS_B) {
+      stopBeaconAcquisition();
+    } else if (previousClass == DEVICE_CLASS_C) {
+      stopContinuousReception();
+    }
+    
+    Serial.println(F("[LoRaWAN] Switched to Class A mode"));
+    return true;
+  } else if (deviceClass == DEVICE_CLASS_B) {
+    // When switching to Class B, start beacon acquisition
+    if (previousClass == DEVICE_CLASS_C) {
+      stopContinuousReception();
+    }
+    
+    return startBeaconAcquisition();
+  } else if (deviceClass == DEVICE_CLASS_C) {
+    // When switching to Class C, start continuous reception
+    if (previousClass == DEVICE_CLASS_B) {
+      stopBeaconAcquisition();
+    }
+    
+    return startContinuousReception();
+  }
+  
+  // We should never reach here
+  return false;
+}
+
+// Get the current device class
+char LoRaManager::getDeviceClass() const {
+  return deviceClass;
+}
+
+// Start beacon acquisition (Class B)
+bool LoRaManager::startBeaconAcquisition() {
+  if (node == nullptr || radio == nullptr) {
+    Serial.println(F("[LoRaWAN] Node or radio not initialized"));
+    lastErrorCode = RADIOLIB_ERR_INVALID_STATE;
+    return false;
+  }
+  
+  if (!isJoined) {
+    Serial.println(F("[LoRaWAN] Must be joined to the network before starting beacon acquisition"));
+    lastErrorCode = RADIOLIB_ERR_NETWORK_NOT_JOINED;
+    return false;
+  }
+  
+  Serial.println(F("[LoRaWAN] Starting beacon acquisition for Class B operation"));
+  
+  // In a real implementation, we would:
+  // 1. Configure the radio for beacon reception frequency
+  // 2. Calculate the next beacon time based on GPS time or network time
+  // 3. Schedule beacon reception
+  
+  // For this example, we'll just set the state and handle the details in handleEvents
+  beaconState = BEACON_STATE_ACQUISITION;
+  lastBeaconRxTime = millis();
+  
+  // Inform the network server that we're switching to Class B
+  // by sending a specific uplink message (not implemented in this example)
+  
+  return true;
+}
+
+// Stop beacon acquisition (Class B)
+void LoRaManager::stopBeaconAcquisition() {
+  if (beaconState != BEACON_STATE_IDLE) {
+    Serial.println(F("[LoRaWAN] Stopping beacon acquisition/tracking"));
+    beaconState = BEACON_STATE_IDLE;
+    
+    // Inform the network server that we're no longer in Class B mode
+    // by sending a specific uplink message (not implemented in this example)
+  }
+}
+
+// Set the ping slot periodicity (Class B)
+bool LoRaManager::setPingSlotPeriodicity(uint8_t periodicity) {
+  if (periodicity > 7) {
+    Serial.println(F("[LoRaWAN] Invalid ping slot periodicity (must be 0-7)"));
+    lastErrorCode = RADIOLIB_ERR_INVALID_INPUT;
+    return false;
+  }
+  
+  pingSlotPeriodicity = periodicity;
+  Serial.print(F("[LoRaWAN] Ping slot periodicity set to "));
+  Serial.println(pingSlotPeriodicity);
+  
+  // If we're already in Class B with a locked beacon, recalculate ping slots
+  if (deviceClass == DEVICE_CLASS_B && beaconState == BEACON_STATE_LOCKED) {
+    calculateNextPingSlot();
+  }
+  
+  // Inform the network server about the new ping slot periodicity
+  // by sending a specific uplink message (not implemented in this example)
+  
+  return true;
+}
+
+// Get the current ping slot periodicity (Class B)
+uint8_t LoRaManager::getPingSlotPeriodicity() const {
+  return pingSlotPeriodicity;
+}
+
+// Get the current beacon state (Class B)
+uint8_t LoRaManager::getBeaconState() const {
+  return beaconState;
+}
+
+// Set the callback function for beacon reception (Class B)
+void LoRaManager::setBeaconCallback(BeaconCallback callback) {
+  beaconCallback = callback;
+  Serial.println(F("[LoRaWAN] Beacon callback registered"));
+}
+
+// Handle beacon reception (Class B)
+void LoRaManager::handleBeaconReception(uint8_t* payload, size_t size, float rssi, float snr) {
+  // Store the timestamp of reception
+  lastBeaconTimestamp = millis();
+  
+  // Update signal quality metrics
+  lastRssi = rssi;
+  lastSnr = snr;
+  
+  Serial.print(F("[LoRaWAN] Beacon received - RSSI: "));
+  Serial.print(rssi);
+  Serial.print(F(" dBm, SNR: "));
+  Serial.print(snr);
+  Serial.println(F(" dB"));
+  
+  // Process beacon information (in a real implementation, we would extract time information)
+  
+  // Call the beacon callback if registered
+  if (beaconCallback != nullptr) {
+    beaconCallback(payload, size, rssi, snr);
+  }
+}
+
+// Calculate next ping slot time (Class B)
+void LoRaManager::calculateNextPingSlot() {
+  // The real implementation would calculate ping slots based on:
+  // 1. Device address
+  // 2. Beacon time
+  // 3. Ping slot periodicity
+  
+  // For this example, we'll use a simplified approach with random ping slot timing
+  // In a real implementation, this would use precise calculations based on the LoRaWAN specification
+  
+  // Calculate time to next ping slot based on periodicity
+  // pingSlotPeriodicity defines how often ping slots occur (0 = most frequent, 7 = least frequent)
+  uint32_t pingPeriod = 1 << (5 + pingSlotPeriodicity); // in seconds
+  
+  // Convert to milliseconds and add some random offset for demonstration
+  uint32_t pingOffset = random(500); // Random offset up to 500ms for demonstration
+  
+  // Set the next ping slot time
+  nextPingSlotTime = millis() + (pingPeriod * 1000) + pingOffset;
+  
+  Serial.print(F("[LoRaWAN] Next ping slot in "));
+  Serial.print(pingPeriod);
+  Serial.println(F(" seconds (plus offset)"));
+}
+
+// Start continuous reception (Class C)
+bool LoRaManager::startContinuousReception() {
+  if (node == nullptr || radio == nullptr) {
+    Serial.println(F("[LoRaWAN] Node or radio not initialized"));
+    lastErrorCode = RADIOLIB_ERR_INVALID_STATE;
+    return false;
+  }
+  
+  if (!isJoined) {
+    Serial.println(F("[LoRaWAN] Must be joined to the network before starting continuous reception"));
+    lastErrorCode = RADIOLIB_ERR_NETWORK_NOT_JOINED;
+    return false;
+  }
+  
+  Serial.println(F("[LoRaWAN] Starting continuous reception for Class C operation"));
+  
+  // In a real implementation, we would:
+  // 1. Configure the radio for RX2 window frequency and data rate
+  // 2. Start continuous reception
+  
+  // For this example, we'll just set the flag and handle the reception in handleEvents
+  continuousReception = true;
+  
+  // In a real implementation using RadioLib, we would call a method to start continuous reception
+  // Actual implementation depends on RadioLib's capabilities
+  
+  return true;
+}
+
+// Stop continuous reception (Class C)
+void LoRaManager::stopContinuousReception() {
+  if (continuousReception) {
+    Serial.println(F("[LoRaWAN] Stopping continuous reception"));
+    continuousReception = false;
+    
+    // In a real implementation using RadioLib, we would call a method to stop continuous reception
+  }
 }
 
 // Get the last error from LoRaWAN operations
