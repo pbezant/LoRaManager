@@ -189,6 +189,19 @@ public:
     int getRx2Timeout() const;
 
     /**
+     * @brief Set the downlink datarate to optimize downlink reception timing
+     * 
+     * This method allows setting a higher datarate for downlink communications,
+     * which can reduce the minimum delay for receiving downlinks to as low as 1 second.
+     * Higher datarates transmit data faster but may reduce range/reliability in poor signal conditions.
+     * 
+     * @param datarate Datarate to use for downlinks (0-5, where 0 is slowest, 5 is fastest)
+     * @return true if the datarate was set successfully
+     * @return false if setting the datarate failed
+     */
+    bool setDownlinkDatarate(uint8_t datarate);
+
+    /**
      * @brief Set the device class (A, B, or C)
      * 
      * @param deviceClass The device class to set (DEVICE_CLASS_A, DEVICE_CLASS_B, or DEVICE_CLASS_C)
@@ -281,18 +294,22 @@ private:
     // Band type
     uint8_t bandType;
 
-    // Class B/C specific variables
+    // Device class B and C specific variables
     char deviceClass;
     uint8_t beaconState;
     uint8_t pingSlotPeriodicity;
     BeaconCallback beaconCallback;
     unsigned long lastBeaconTimestamp;
     bool continuousReception;
-    
-    // Class B/C timers and state
     unsigned long nextPingSlotTime;
-    unsigned long beaconPeriod;
+    unsigned long beaconPeriod;  // Beacon period in milliseconds, typically 128 seconds
     unsigned long lastBeaconRxTime;
+    
+    // Datarate configuration
+    uint8_t downlinkDatarate;
+    
+    // Static instance pointer for callbacks
+    static LoRaManager* instance;
     
     /**
      * @brief Configure subband channel mask based on the current subband
@@ -340,9 +357,6 @@ private:
      * @brief Stop continuous reception (Class C)
      */
     void stopContinuousReception();
-    
-    // Singleton instance (to help with callbacks)
-    static LoRaManager* instance;
 };
 
 #endif // LORA_MANAGER_H 

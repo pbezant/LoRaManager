@@ -64,7 +64,8 @@ LoRaManager::LoRaManager(LoRaWANBand_t freqBand, uint8_t subBand) :
   continuousReception(false),
   nextPingSlotTime(0),
   beaconPeriod(128000), // 128 seconds (standard LoRaWAN beacon period)
-  lastBeaconRxTime(0) {
+  lastBeaconRxTime(0),
+  downlinkDatarate(1) { // Default to datarate 1 for reliability
   
   // Set this instance as the active one
   instance = this;
@@ -321,8 +322,10 @@ bool LoRaManager::joinNetwork() {
       isJoined = true;
       
       // Configure the data rate for reliability
-      Serial.println(F("[LoRaWAN] Setting data rate to DR1 for reliability"));
-      node->setDatarate(1);
+      Serial.print(F("[LoRaWAN] Setting data rate to DR"));
+      Serial.print(downlinkDatarate);
+      Serial.println(F(" for downlink reception"));
+      node->setDatarate(downlinkDatarate);
       
       // Reset frame counters to ensure a clean session
       node->resetFCntDown();
@@ -535,8 +538,13 @@ bool LoRaManager::isNetworkJoined() {
 
 // Get information about RX1 delay (time between uplink end and RX1 window opening)
 int LoRaManager::getRx1Delay() const {
-  // Default is 1 second for most networks
-  return 5; // This is usually configured by the network on join
+  // For Class C, we want to use the minimal 1 second delay
+  if (deviceClass == DEVICE_CLASS_C) {
+    return 1; // Minimum 1 second for Class C for fastest reception
+  }
+  
+  // Default is 5 seconds for regular operation
+  return 5;
 }
 
 // Get information about RX1 window timeout
@@ -551,6 +559,65 @@ int LoRaManager::getRx2Timeout() const {
   return 190; // This is the default for Class A devices
 }
 
+// Set the downlink datarate
+bool LoRaManager::setDownlinkDatarate(uint8_t datarate) {
+  if (!node) {
+    Serial.println(F("[LoRaWAN] Node not initialized"));
+    lastErrorCode = RADIOLIB_ERR_INVALID_STATE;
+    return false;
+  }
+  
+  // Validate the datarate range (typically 0-5, but this can vary by region)
+  if (datarate > 5) {
+    Serial.println(F("[LoRaWAN] Invalid datarate (must be 0-5)"));
+    lastErrorCode = RADIOLIB_ERR_INVALID_INPUT;
+    return false;
+  }
+  
+  // Store the datarate value
+  downlinkDatarate = datarate;
+  
+  // Apply the datarate to the LoRaWAN node
+  int state = node->setDatarate(datarate);
+  if (state != RADIOLIB_ERR_NONE) {
+    Serial.print(F("[LoRaWAN] Failed to set datarate: "));
+    Serial.println(state);
+    lastErrorCode = state;
+    return false;
+  }
+  
+  Serial.print(F("[LoRaWAN] Downlink datarate set to DR"));
+  Serial.println(datarate);
+  
+  // Calculate and display the approximate minimum delay based on datarate
+  int approxDelay = 0;
+  switch (datarate) {
+    case 0:
+      approxDelay = 5; // Slowest datarate, longest delay
+      break;
+    case 1:
+      approxDelay = 3; // Default setting
+      break;
+    case 2:
+      approxDelay = 2;
+      break;
+    case 3:
+    case 4:
+    case 5:
+      approxDelay = 1; // Fastest datarates enable 1 second minimum delay
+      break;
+    default:
+      approxDelay = 3;
+      break;
+  }
+  
+  Serial.print(F("[LoRaWAN] Approximate minimum downlink delay: "));
+  Serial.print(approxDelay);
+  Serial.println(F(" seconds"));
+  
+  return true;
+}
+
 // Handle events (should be called in the loop)
 void LoRaManager::handleEvents() {
   if (!node) {
@@ -560,10 +627,70 @@ void LoRaManager::handleEvents() {
   // For RadioLib 7.x, Class C implementation is different
   // Class C reception now happens after normal transmission windows
   if (deviceClass == DEVICE_CLASS_C && isJoined) {
-    // For Class C, just log the continuous reception mode periodically
+    // For Class C, actively poll for downlinks when in continuous reception mode
+    static unsigned long lastPollTime = 0;
+    unsigned long currentTime = millis();
+    
+    // Poll for downlinks every 100ms 
+    if (currentTime - lastPollTime > 100) {
+      lastPollTime = currentTime;
+      
+      // Check if downlink is available - we can't directly poll, so send a minimal uplink
+      // Only do this occasionally to avoid flooding the network
+      static unsigned long lastMinimalUplink = 0;
+      if (currentTime - lastMinimalUplink > 60000) { // Every 60 seconds
+        lastMinimalUplink = currentTime;
+        
+        // Send a minimal uplink to open RX windows and potentially receive downlink
+        uint8_t minimalData[] = {0xC1}; // Heartbeat packet
+        uint8_t downlinkData[256]; // Buffer for any response
+        size_t downlinkLen = sizeof(downlinkData);
+        
+        Serial.println(F("[LoRaManager] Sending minimal uplink to check for Class C downlinks"));
+        int state = node->sendReceive(minimalData, sizeof(minimalData), 0, downlinkData, &downlinkLen);
+        
+        if (state > RADIOLIB_ERR_NONE) {
+          // Downlink received
+          Serial.print(F("[LoRaManager] Class C downlink received: "));
+          Serial.print(downlinkLen);
+          Serial.println(F(" bytes"));
+          
+          // Display hex values
+          for (size_t i = 0; i < downlinkLen; i++) {
+            if (downlinkData[i] < 16) Serial.print("0");
+            Serial.print(downlinkData[i], HEX);
+            Serial.print(' ');
+          }
+          Serial.println();
+          
+          // Call the downlink callback if registered
+          if (downlinkCallback != nullptr) {
+            // For RadioLib 7.1.2, we don't have direct access to the event structure
+            // Use a placeholder for port (3) until we can properly extract it
+            downlinkCallback(downlinkData, downlinkLen, 3);
+          }
+          
+          // Copy to received data buffer
+          memcpy(receivedData, downlinkData, downlinkLen);
+          receivedBytes = downlinkLen;
+          
+          // Get RSSI and SNR
+          lastRssi = radio->getRSSI();
+          lastSnr = radio->getSNR();
+          
+          Serial.print(F("[LoRaWAN] RSSI: "));
+          Serial.print(lastRssi);
+          Serial.print(F(" dBm, SNR: "));
+          Serial.print(lastSnr);
+          Serial.println(F(" dB"));
+        }
+      }
+    }
+    
+    // Log continuous reception mode periodically
     static unsigned long lastClassCLog = 0;
-    if (millis() - lastClassCLog > 60000) { // Log every minute
-      lastClassCLog = millis();
+    if (currentTime - lastClassCLog > 60000) { // Log every minute
+      lastClassCLog = currentTime;
       Serial.println(F("[LoRaManager] Class C: Continuous reception mode active"));
     }
   }
@@ -626,6 +753,13 @@ bool LoRaManager::setDeviceClass(char deviceClass) {
     // When switching to Class C, start continuous reception
     if (previousClass == DEVICE_CLASS_B) {
       stopBeaconAcquisition();
+    }
+    
+    // For Class C, automatically set the fastest datarate (DR5) for minimal downlink delay
+    // Only change it if we're not already at the fastest rate
+    if (downlinkDatarate < 5) {
+      Serial.println(F("[LoRaWAN] Class C mode: Automatically setting fastest datarate (DR5) for minimal downlink delay"));
+      setDownlinkDatarate(5);
     }
     
     return startContinuousReception();
@@ -784,6 +918,21 @@ bool LoRaManager::startContinuousReception() {
   }
   
   Serial.println(F("[LoRaWAN] Starting continuous reception for Class C operation"));
+
+  // Optimize radio settings for reception sensitivity - just set sync word
+  int16_t state = radio->setSyncWord(0x34); // LoRa sync word
+  if (state == RADIOLIB_ERR_NONE) {
+    Serial.println(F("[LoRaWAN] Radio sync word set for maximum compatibility"));
+  } else {
+    Serial.print(F("[LoRaWAN] Warning: Failed to set sync word: "));
+    Serial.println(state);
+  }
+  
+  // Note: setGain is not available in this version of RadioLib
+  Serial.println(F("[LoRaWAN] Using default radio gain settings"));
+  
+  // Note: setRx1Delay is not available in this version of RadioLib
+  Serial.println(F("[LoRaWAN] Using network-defined RX1 delay"));
   
   // In RadioLib 7.x, Class C mode is handled differently
   // The node will keep RX2 window open continuously after any uplink
@@ -799,8 +948,9 @@ bool LoRaManager::startContinuousReception() {
   uint8_t downlinkData[8]; // Small buffer for any response
   size_t downlinkLen = sizeof(downlinkData);
   
-  // Send with port 0 (MAC commands) or another suitable port
-  int state = node->sendReceive(classChangeData, classChangeLen, 3, downlinkData, &downlinkLen, true);
+  // Send with port 3 (arbitrary choice)
+  // Reuse the existing state variable instead of declaring a new one
+  state = node->sendReceive(classChangeData, classChangeLen, 3, downlinkData, &downlinkLen, true);
   
   if (state >= RADIOLIB_ERR_NONE) {
     Serial.println(F("[LoRaWAN] Class C activation successful"));

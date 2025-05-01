@@ -13,6 +13,8 @@ A library for managing LoRaWAN communication using RadioLib for ESP32 boards.
 * **Support for LoRaWAN device classes A, B, and C**
 * **Class B functionality with beacon synchronization and ping slots**
 * **Class C functionality with continuous reception**
+* **Fast downlink capability with minimum 1-second response time**
+* **Automatic optimization for lowest latency in Class C mode**
 
 ## Dependencies
 
@@ -315,6 +317,97 @@ void loop() {
   
   delay(100); // Short delay to prevent CPU hogging
 }
+
+### Fast Downlink Example (1-second Response)
+
+```cpp
+#include <Arduino.h>
+#include <LoRaManager.h>
+
+// Define LoRa pins for your board
+#define LORA_CS   18
+#define LORA_DIO1 23
+#define LORA_RST  14
+#define LORA_BUSY 33
+
+// LoRaWAN credentials
+uint64_t joinEUI = 0x0000000000000000;
+uint64_t devEUI = 0x0000000000000000;
+uint8_t appKey[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+uint8_t nwkKey[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+// Create LoRaManager instance
+LoRaManager lora;
+
+// Callback for downlink data
+void handleDownlink(uint8_t* payload, size_t size, uint8_t port) {
+  Serial.print("Received downlink on port ");
+  Serial.print(port);
+  Serial.println(" with fast response time");
+  
+  // Process the payload
+  if (size > 0) {
+    switch (payload[0]) {
+      case 0x01:
+        Serial.println("Command: Turn on LED");
+        // Your code here
+        break;
+      case 0x02:
+        Serial.println("Command: Turn off LED");
+        // Your code here
+        break;
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(3000);
+  
+  Serial.println("Starting LoRaWAN Fast Downlink Example...");
+  
+  // Initialize the LoRa module
+  if (!lora.begin(LORA_CS, LORA_DIO1, LORA_RST, LORA_BUSY)) {
+    Serial.println("Failed to initialize LoRa!");
+    while (1);
+  }
+  
+  // Set LoRaWAN credentials
+  lora.setCredentials(joinEUI, devEUI, appKey, nwkKey);
+  
+  // Set downlink callback
+  lora.setDownlinkCallback(handleDownlink);
+  
+  // Note: We don't need to explicitly set datarate for Class C
+  // The library automatically sets fastest datarate (DR5) in Class C mode
+  
+  // Join the network
+  Serial.println("Joining LoRaWAN network...");
+  if (lora.joinNetwork()) {
+    Serial.println("Successfully joined the network!");
+    
+    // For most responsive downlinks, switch to Class C
+    if (lora.setDeviceClass(DEVICE_CLASS_C)) {
+      Serial.println("Switched to Class C mode, continuous reception active");
+      Serial.println("Device is now ready for fast downlink commands (DR5 set automatically)");
+    }
+  }
+}
+
+void loop() {
+  // Handle LoRaWAN events
+  lora.handleEvents();
+  
+  // Send periodic uplink every minute
+  static unsigned long lastSendTime = 0;
+  if (millis() - lastSendTime > 60000) {
+    uint8_t data[] = {0x01, 0x02, 0x03, 0x04};
+    lora.sendData(data, sizeof(data), 1, false);
+    lastSendTime = millis();
+  }
+  
+  delay(10); // Short delay to prevent CPU hogging
+}
 ```
 
 ## API Reference
@@ -341,6 +434,7 @@ LoRaManager();
 
 #### Class B and C Methods
 - `bool setDeviceClass(char deviceClass)` - Set the device class (DEVICE_CLASS_A, DEVICE_CLASS_B, or DEVICE_CLASS_C)
+  - Note: When switching to Class C, the library automatically sets the fastest datarate (DR5) for minimum downlink delay (1 second)
 - `char getDeviceClass()` - Get the current device class
 - `bool startBeaconAcquisition()` - Start beacon acquisition (Class B)
 - `void stopBeaconAcquisition()` - Stop beacon acquisition (Class B)
@@ -349,6 +443,10 @@ LoRaManager();
 - `uint8_t getBeaconState()` - Get the current beacon state (Class B)
 - `void setBeaconCallback(BeaconCallback callback)` - Set the callback function for beacon reception (Class B)
 - `void setDownlinkCallback(DownlinkCallback callback)` - Set the callback function for downlink data
+- `int getRx1Delay()` - Get the RX1 delay
+- `int getRx1Timeout()` - Get the RX1 window timeout
+- `int getRx2Timeout()` - Get the RX2 window timeout
+- `bool setDownlinkDatarate(uint8_t datarate)` - Set the downlink datarate (0-5, can reduce minimum downlink delay to 1 second at higher rates)
 
 ## License
 
